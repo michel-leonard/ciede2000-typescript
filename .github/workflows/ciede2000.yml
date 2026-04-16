@@ -1,0 +1,117 @@
+name: TypeScript CIEDE2000 Testing
+
+on:
+  workflow_dispatch:
+
+env:
+  n_csv_lines: 10000000
+
+jobs:
+  test-implementation-de00-ts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📂 For each step below, a new shell will be started at the repository root
+        uses: actions/checkout@v6
+
+      - name: 📦 Set up TypeScript and GCC
+        run: |
+          command -v node > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes nodejs npm ; }
+          command -v tsc > /dev/null || {
+            MAJOR_VERSION=$(npm view typescript versions | awk 'match($0,/[0-9]+/,m){v=m[0]}END{print v-1}')
+            npm install --global typescript@$MAJOR_VERSION
+          }
+          command -v gcc > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes gcc ; }
+
+      - name: 🔧 Create TypeScript Driver
+        run: |
+          printf '%s\n' '' \
+          'import * as fs from "fs";' \
+          'import * as readline from "readline";' \
+          '' \
+          'const canonical: boolean = 3 < process.argv.length;' \
+          'const filename: string = process.argv[2];' \
+          '' \
+          'const lineReader = readline.createInterface({' \
+          '	input: fs.createReadStream(filename),' \
+          '	crlfDelay: Infinity' \
+          '});' \
+          '' \
+          'lineReader.on("line", (line: string) => {' \
+          '	const result = ciede2000(...(line.split(",").map(parseFloat) as [number, number, number, number, number, number, number, number, number]), canonical);' \
+          '	console.log(line + "," + result);' \
+          '});' \
+          '' >> ciede2000.ts
+
+      - name: 🔧 Create package.json
+        run: |
+          TYPESCRIPT_MAJOR_VERSION=$(tsc --version | awk 'match($0,/[0-9]+/,m){print m[0];exit}')
+          NODE_MAJOR_VERSION=$(node --version | awk 'match($0,/[0-9]+/,m){print m[0];exit}')
+          printf '%s\n' \
+          '{' \
+          '  "name": "delta-e-2000-ts",' \
+          '  "version": "1.0.0",' \
+          '  "type": "commonjs",' \
+          '  "scripts": {' \
+          '    "build": "tsc",' \
+          '    "start": "node dist/ciede2000.js"' \
+          '  },' \
+          '  "devDependencies": {' \
+          '    "typescript": "^'$TYPESCRIPT_MAJOR_VERSION'",' \
+          '    "@types/node": "^'$NODE_MAJOR_VERSION'"' \
+          '  }' \
+          '}' > package.json
+          # Display newly created file
+          cat package.json
+
+      - name: 🔧 Create tsconfig.json
+        run: |
+          printf '%s\n' '{' \
+          '  "compilerOptions": {' \
+          '    "module": "CommonJS",' \
+          '    "strict": true,' \
+          '    "esModuleInterop": true,' \
+          '    "outDir": "dist",' \
+          '    "types": ["node"]' \
+          '  },' \
+          '  "include": ["ciede2000.ts"]' \
+          '}' > tsconfig.json
+
+      - name: ⚙️ Install dependencies and compile TypeScript
+        run: tsc --version && node --version && npm --version && npm install --no-audit && npm run build
+
+      - name: 🌐️ Download the CIEDE2000 driver program
+        run: wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-native-precision-driver.c
+
+      - name: ⚙️ Compile the CIEDE2000 driver program in C99
+        run: gcc --version && gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-native-precision-driver.c -o ciede2000-native -lm
+
+      - name: 🎨 Generate ΔE2000 color difference test cases
+        run: ./ciede2000-native --number $n_csv_lines --with-weights --output-file test-cases.csv
+
+      - name: 🚀 Run test cases in TypeScript and stream to verifier
+        run: |
+          export NODE_OPTIONS="--max-old-space-size=128"
+          node dist/ciede2000.js test-cases.csv --canonical | ./ciede2000-native -o summary-canonical.txt &
+          node dist/ciede2000.js test-cases.csv | ./ciede2000-native -o summary-simplified.txt &
+          wait
+
+      - name: 🏁 Conclusion
+        run: |
+          for compliance in simplified canonical; do
+            file="summary-$compliance.txt"
+            cat "$file"
+            #
+            if [ "${file%canonical.txt}" = "$file" ]; then
+              Q1="[ ] CANONICAL [X] SIMPLIFIED"
+            else
+              Q1="[X] CANONICAL [ ] SIMPLIFIED"
+            fi
+            if grep -Fq "$Q1" "$file" && grep -Fq "Error : 0" "$file" && grep -Fq "Successes : $n_csv_lines" "$file"; then
+              echo "✔️ Verification of $file successful: all $n_csv_lines color differences were correctly calculated."
+            else
+              echo "❌ Verification failed. See above for details."
+              exit 1
+            fi
+          done
